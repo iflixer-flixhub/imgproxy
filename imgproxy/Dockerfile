@@ -1,0 +1,28 @@
+# -------- build --------
+FROM golang:1.23-bookworm AS build
+WORKDIR /src
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libvips-dev \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=1 go build -o /out/imgproxy .
+
+# -------- runtime --------
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libvips \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/imgproxy /app/imgproxy
+RUN chmod 0755 /app/imgproxy
+EXPOSE 8080
+# ENV LISTEN=:8080
+CMD ["/app/imgproxy"]
