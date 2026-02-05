@@ -19,6 +19,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libwebp7 \
     ca-certificates \
+    wget curl \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/imgproxy /app/imgproxy

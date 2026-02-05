@@ -30,7 +30,9 @@ func main() {
 
 	r := chi.NewRouter()
 	r.Get("/readyz", app.Readyz)
+	r.Head("/readyz", app.Readyz)
 	r.Get("/healthz", app.Healthz)
+	r.Head("/healthz", app.Healthz)
 	r.Get("/sss/{type}/{id}/{md5}", app.handleSSS)
 
 	addr := env("LISTEN", ":80")

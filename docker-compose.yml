@@ -42,7 +42,7 @@ services:
       - "34201:80"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/readyz >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:80/healthz >/dev/null"]
       interval: 5s
       timeout: 2s
       retries: 30
