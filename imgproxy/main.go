@@ -1,10 +1,12 @@
-package imgproxy
+package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"log"
 	"net/http"
@@ -12,16 +14,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chai2010/webp"
+	"github.com/disintegration/imaging"
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/go-chi/chi/v5"
-
-	"github.com/davidbyttow/govips/v2/vips"
 )
 
 func main() {
-	vips.Startup(nil)
-	defer vips.Shutdown()
 
 	app, err := newApp()
 	if err != nil {
@@ -29,21 +29,35 @@ func main() {
 	}
 
 	r := chi.NewRouter()
-	r.Get("/readyz", app.handleReadyz)
+	r.Get("/readyz", app.Readyz)
+	r.Get("/healthz", app.Healthz)
 	r.Get("/sss/{type}/{id}/{md5}", app.handleSSS)
 
-	addr := env("LISTEN", env("LISTEN", ""))
+	addr := env("LISTEN", ":80")
 	log.Printf("listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, r))
 }
 
-func (a *App) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(200)
-	_, _ = w.Write([]byte("ok"))
+func (a *App) Healthz(w http.ResponseWriter, _ *http.Request) {
+	// живой ли апп
+	w.WriteHeader(http.StatusOK)
+}
+
+func (a *App) Readyz(w http.ResponseWriter, r *http.Request) {
+	// живой ли апп и готов ли к работе (БД, хранилище)
+	// ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+	// defer cancel()
+	// if err := db.PingContext(ctx); err != nil {
+	// 	http.Error(w, "db not ready", 503)
+	// 	return
+	// }
+	w.WriteHeader(http.StatusOK)
 }
 
 func (a *App) handleSSS(w http.ResponseWriter, r *http.Request) {
-	t0 := time.Now()
+	startTime := time.Now()
+	var startTimeLap time.Time
+	logLap(startTime, &startTimeLap, "start")
 
 	typ := chi.URLParam(r, "type")
 	idStr := chi.URLParam(r, "id")
@@ -68,9 +82,29 @@ func (a *App) handleSSS(w http.ResponseWriter, r *http.Request) {
 	origKey := fmt.Sprintf("%s/%s/%d/%s", a.prefix, typ, id, hash)
 	fullKey := fmt.Sprintf("%s/%s/%d/%s", a.prefix, typ, id, md5clean)
 
-	// 1) try original in storage
-	origBody, origCT, origETag, ok, err := a.getObject(r.Context(), origKey)
+	log.Printf("GET: %s", fullKey)
+
+	// try resized in storage first (optimization)
+	served, err := a.serveFromS3IfPresent(w, r, fullKey, "resized-cache", startTime)
+	logLap(startTime, &startTimeLap, "s3 head+maybe-get resized")
 	if err != nil {
+		log.Println("s3 serve resized error:", err)
+		// если served=true, ответ мог уже частично уйти; безопаснее просто выйти
+		if served {
+			return
+		}
+		http.Error(w, "storage error", 424)
+		return
+	}
+	if served {
+		return
+	}
+
+	// try original in storage
+	origBody, origCT, _, ok, err := a.getObject(r.Context(), origKey)
+	logLap(startTime, &startTimeLap, "s3 get orig")
+	if err != nil {
+		log.Println("error s3 get orig", err)
 		http.Error(w, "storage error", 424)
 		return
 	}
@@ -81,28 +115,35 @@ func (a *App) handleSSS(w http.ResponseWriter, r *http.Request) {
 	var responseCode = 200
 
 	if ok {
+		log.Println("s3 get orig ok")
 		data = origBody
 		contentType = origCT
 		source = "orig-cache"
 	} else {
+		log.Println("s3 get orig 404")
 		// 2) resolve remote url via DB
 		remoteURL, err := a.remoteURLFromDB(r.Context(), typ, id, hash)
+		logLap(startTime, &startTimeLap, "db get remote url")
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
+				log.Println("db - not found hash", hash)
 				http.Error(w, "not found", 404)
 				return
 			}
+			log.Println("db error", err)
 			http.Error(w, "db error", 424)
 			return
 		}
 
 		body, ct, code, err := a.fetchRemoteWithRedirects(r.Context(), remoteURL)
+		logLap(startTime, &startTimeLap, "fetch orig url")
 		if err != nil {
-			http.Error(w, "fetch error", 424)
+			log.Println("fetch error", remoteURL, err)
 			return
 		}
 		if code == 404 {
 			// твоя логика: "заглушка" с 404
+			log.Println("fetch 404", remoteURL, err)
 			http.Error(w, "not found", 404)
 			return
 		}
@@ -112,36 +153,34 @@ func (a *App) handleSSS(w http.ResponseWriter, r *http.Request) {
 		contentType = ct
 		source = "remote"
 
-		// upload original
-		et, err := a.putObject(r.Context(), origKey, contentType, data)
-		if err != nil {
-			http.Error(w, "upload orig error", 424)
-			return
-		}
-		origETag = et
+		// upload original - асинхронно
+		a.uploadAsync(origKey, contentType, data)
 	}
 
 	// 3) resize if requested
 	if resize != "" {
+		log.Printf("resizing to %s", resize)
 		resized, err := resizeToWebP(data, resize)
+		logLap(startTime, &startTimeLap, "resize to webp")
 		if err != nil {
+			log.Println("resize error", err)
 			http.Error(w, "resize error", 400)
 			return
 		}
+
 		ct := "image/webp"
-		etag, err := a.putObject(r.Context(), fullKey, ct, resized)
-		if err != nil {
-			http.Error(w, "upload resized error", 424)
-			return
-		}
-		writeCommon(w, r, ct, etag, "resized-"+source, time.Since(t0))
+		// upload resized - асинхронно. etag пустой при этом но сгенерится при повторном запросе
+		a.uploadAsync(fullKey, ct, resized)
+
+		localEtag := md5hex(string(resized))
+		writeCommon(w, r, ct, localEtag, "resized-"+source, time.Since(startTime))
 		w.WriteHeader(responseCode)
 		_, _ = w.Write(resized)
 		return
 	}
 
-	// 4) return original
-	writeCommon(w, r, contentType, origETag, "orig-"+source, time.Since(t0))
+	logLap(startTime, &startTimeLap, "total http process")
+	writeCommon(w, r, contentType, md5hex(string(data)), "orig-"+source, time.Since(startTime))
 	w.WriteHeader(responseCode)
 	_, _ = w.Write(data)
 }
@@ -286,52 +325,40 @@ func resizeToWebP(input []byte, resize string) ([]byte, error) {
 	if strings.HasPrefix(resize, "h") {
 		v, err := strconv.Atoi(strings.TrimPrefix(resize, "h"))
 		if err != nil || v <= 0 {
-			return nil, errors.New("bad resize")
+			return nil, fmt.Errorf("bad resize")
+		}
+		if v%100 != 0 {
+			return nil, fmt.Errorf("bad resize: height must be multiple of 100")
 		}
 		h = v
 	} else {
 		v, err := strconv.Atoi(resize)
 		if err != nil || v <= 0 {
-			return nil, errors.New("bad resize")
+			return nil, fmt.Errorf("bad resize")
+		}
+		if v%100 != 0 {
+			return nil, fmt.Errorf("bad resize: width must be multiple of 100")
 		}
 		w = v
 	}
 	if w > 1000 || h > 1000 {
-		return nil, errors.New("too big")
+		return nil, fmt.Errorf("too big")
 	}
 
-	img, err := vips.NewImageFromBuffer(input)
+	img, _, err := image.Decode(bytes.NewReader(input))
 	if err != nil {
 		return nil, err
 	}
-	defer img.Close()
 
-	// keep aspect ratio: resize by ratio
-	if w > 0 {
-		ratio := float64(w) / float64(img.Width())
-		if ratio > 1 {
-			ratio = 1
-		}
-		if err := img.Resize(ratio, vips.KernelLanczos3); err != nil {
-			return nil, err
-		}
-	} else if h > 0 {
-		ratio := float64(h) / float64(img.Height())
-		if ratio > 1 {
-			ratio = 1
-		}
-		if err := img.Resize(ratio, vips.KernelLanczos3); err != nil {
-			return nil, err
-		}
-	}
+	// preserve aspect ratio if one side is 0
+	outImg := imaging.Resize(img, w, h, imaging.Lanczos)
 
-	ep := vips.NewWebpExportParams()
-	ep.Quality = 80
-	out, _, err := img.ExportWebp(ep)
-	if err != nil {
+	var buf bytes.Buffer
+	// quality 80 примерно как у тебя
+	if err := webp.Encode(&buf, outImg, &webp.Options{Quality: 80}); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return buf.Bytes(), nil
 }
 
 func writeCommon(w http.ResponseWriter, r *http.Request, ct, etag, source string, dur time.Duration) {

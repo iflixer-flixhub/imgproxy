@@ -1,4 +1,4 @@
-package imgproxy
+package main
 
 import (
 	"context"
@@ -25,6 +25,7 @@ type App struct {
 	httpClient *http.Client
 	maxFetch   int64
 	maxRedir   int
+	uploadSem  chan struct{}
 }
 
 func newApp() (*App, error) {
@@ -81,5 +82,6 @@ func newApp() (*App, error) {
 		httpClient: &http.Client{Timeout: timeout},
 		maxFetch:   envInt64("MAX_FETCH_BYTES", 10<<20),
 		maxRedir:   5,
+		uploadSem:  make(chan struct{}, 32),
 	}, nil
 }

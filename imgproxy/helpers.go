@@ -1,8 +1,9 @@
-package imgproxy
+package main
 
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -63,4 +64,23 @@ func envInt64(k string, def int64) int64 {
 		return def
 	}
 	return n
+}
+
+func logLap(start time.Time, last *time.Time, msg string) {
+	if env("DEBUG_TIME_LOGGING", "0") != "1" {
+		return
+	}
+	now := time.Now()
+	total := now.Sub(start).Round(time.Millisecond)
+	if last == nil || last.IsZero() {
+		log.Printf("%s took %s (total %s)", msg, 0*time.Millisecond, total)
+		t := now
+		if last != nil {
+			*last = t
+		}
+		return
+	}
+	lap := now.Sub(*last).Round(time.Millisecond)
+	log.Printf("%s took +%s (total %s)", msg, lap, total)
+	*last = now
 }

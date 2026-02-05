@@ -20,6 +20,7 @@ services:
 
   imgproxy:
     platform: linux/arm64
+    # image: ghcr.io/iflixer-flixhub/imgproxy:latest
     build:
       context: ./imgproxy
       dockerfile: Dockerfile
@@ -32,6 +33,7 @@ services:
       S3_BUCKET: "${S3_BUCKET}"
       S3_PREFIX: "cdnhub/sss"
       S3_REGION: "auto"
+      DEBUG_TIME_LOGGING: "1"
 
     depends_on:
       mysql:
