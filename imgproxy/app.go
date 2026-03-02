@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -48,6 +49,13 @@ func newApp() (*App, error) {
 	// --- S3/R2
 	accessKey := env("S3_ACCESS_KEY", "")
 	secretKey := env("S3_SECRET_KEY", "")
+	if secretKey == "" {
+		secretKeyFile := env("S3_SECRET_KEY_FILE", "")
+		sk, err := os.ReadFile(secretKeyFile)
+		if err == nil {
+			secretKey = strings.TrimSpace(string(sk))
+		}
+	}
 	endpoint := env("S3_ENDPOINT", "")
 	region := env("S3_REGION", "auto")
 	bucket := env("S3_BUCKET", "")
