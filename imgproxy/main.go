@@ -88,7 +88,7 @@ func (a *App) handleSSS(w http.ResponseWriter, r *http.Request) {
 
 	// try resized in storage first (optimization)
 	served, err := a.serveFromS3IfPresent(w, r, fullKey, "resized-cache", startTime)
-	logLap(startTime, &startTimeLap, "s3 head+maybe-get resized")
+	logLap(startTime, &startTimeLap, "s3 get resized")
 	if err != nil {
 		log.Println("s3 serve resized error:", err)
 		// если served=true, ответ мог уже частично уйти; безопаснее просто выйти

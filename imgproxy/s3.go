@@ -84,40 +84,6 @@ func (a *App) uploadAsync(key, ct string, data []byte) {
 	}()
 }
 
-func (a *App) headObject(ctx context.Context, key string) (ct, etag string, size int64, ok bool, err error) {
-	out, err := a.s3.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: &a.bucket,
-		Key:    &key,
-	})
-	if err != nil {
-		// подстрой под свой детектор NotFound как в getObject
-		msg := err.Error()
-		if strings.Contains(msg, "NotFound") || strings.Contains(msg, "NoSuchKey") {
-			return "", "", 0, false, nil
-		}
-		return "", "", 0, false, err
-	}
-
-	ct = aws.ToString(out.ContentType)
-	etag = strings.Trim(aws.ToString(out.ETag), `"`)
-	size = *out.ContentLength
-	return ct, etag, size, true, nil
-}
-
-func (a *App) streamObject(ctx context.Context, key string, w http.ResponseWriter) error {
-	out, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &a.bucket,
-		Key:    &key,
-	})
-	if err != nil {
-		return err
-	}
-	defer out.Body.Close()
-
-	_, err = io.Copy(w, out.Body)
-	return err
-}
-
 // Возвращает true если ответ уже отправлен (304 или 200 из кеша), иначе false.
 func (a *App) serveFromS3IfPresent(
 	w http.ResponseWriter,
@@ -126,14 +92,22 @@ func (a *App) serveFromS3IfPresent(
 	source string,
 	start time.Time,
 ) (bool, error) {
-
-	ct, etag, size, ok, err := a.headObject(r.Context(), key)
+	out, err := a.s3.GetObject(r.Context(), &s3.GetObjectInput{
+		Bucket: &a.bucket,
+		Key:    &key,
+	})
 	if err != nil {
+		var nsk *types.NoSuchKey
+		if errors.As(err, &nsk) || strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "NotFound") {
+			return false, nil
+		}
 		return false, err
 	}
-	if !ok {
-		return false, nil
-	}
+	defer out.Body.Close()
+
+	ct := aws.ToString(out.ContentType)
+	etag := strings.Trim(aws.ToString(out.ETag), `"`)
+	size := aws.ToInt64(out.ContentLength)
 
 	// 304 без скачивания тела
 	if inm := strings.Trim(r.Header.Get("If-None-Match"), `"`); inm != "" && etag != "" && inm == etag {
@@ -152,7 +126,7 @@ func (a *App) serveFromS3IfPresent(
 	w.WriteHeader(http.StatusOK)
 
 	// Стримим тело (не аллоцируем весь файл)
-	if err := a.streamObject(r.Context(), key, w); err != nil {
+	if _, err := io.Copy(w, out.Body); err != nil {
 		// Тут уже поздно делать http.Error (заголовки отправлены).
 		// Остаётся только лог.
 		return true, err
