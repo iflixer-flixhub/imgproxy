@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type App struct {
@@ -80,7 +83,7 @@ func newApp() (*App, error) {
 
 	timeout := envDuration("HTTP_TIMEOUT", 10*time.Second)
 
-	return &App{
+	app := &App{
 		db: db,
 
 		s3:     s3c,
@@ -91,5 +94,116 @@ func newApp() (*App, error) {
 		maxFetch:   envInt64("MAX_FETCH_BYTES", 10<<20),
 		maxRedir:   5,
 		uploadSem:  make(chan struct{}, 32),
-	}, nil
+	}
+
+	if envBool("S3_INIT_CHECK", true) {
+		if err := app.checkS3Access(context.Background()); err != nil {
+			return nil, err
+		}
+	} else {
+		log.Printf("s3 init access checks are disabled (S3_INIT_CHECK=false)")
+	}
+
+	return app, nil
+}
+
+func (a *App) checkS3Access(ctx context.Context) error {
+	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	probePrefix := strings.TrimSuffix(a.prefix, "/")
+	if probePrefix == "" {
+		probePrefix = "cdnhub/sss"
+	}
+	probeBase := fmt.Sprintf("%s/__init_access_probe/%d", probePrefix, time.Now().UnixNano())
+	readProbeKey := probeBase + "-read-miss"
+	writeProbeKey := probeBase + "-write"
+
+	if err := a.checkS3Read(checkCtx, readProbeKey); err != nil {
+		return err
+	}
+	if err := a.checkS3Write(checkCtx, writeProbeKey); err != nil {
+		return err
+	}
+	if err := a.checkS3Head(checkCtx, readProbeKey); err != nil {
+		if isS3AccessDenied(err) {
+			log.Printf("s3 head access denied, continue without HeadObject: %v", err)
+		} else {
+			return err
+		}
+	}
+
+	log.Printf("s3 access checks passed: read/write ok")
+	return nil
+}
+
+func (a *App) checkS3Read(ctx context.Context, key string) error {
+	out, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(a.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return nil
+		}
+		if isS3AccessDenied(err) {
+			return fmt.Errorf("s3 read access denied (GetObject): %w", err)
+		}
+		return fmt.Errorf("s3 read check failed (GetObject): %w", err)
+	}
+	defer out.Body.Close()
+	return nil
+}
+
+func (a *App) checkS3Write(ctx context.Context, key string) error {
+	_, err := a.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(a.bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader([]byte("ok")),
+		ContentType: aws.String("text/plain"),
+	})
+	if err != nil {
+		if isS3AccessDenied(err) {
+			return fmt.Errorf("s3 write access denied (PutObject): %w", err)
+		}
+		return fmt.Errorf("s3 write check failed (PutObject): %w", err)
+	}
+
+	if _, err := a.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(a.bucket),
+		Key:    aws.String(key),
+	}); err != nil {
+		log.Printf("s3 access check cleanup warning (DeleteObject): key=%s err=%v", key, err)
+	}
+
+	return nil
+}
+
+func (a *App) checkS3Head(ctx context.Context, key string) error {
+	_, err := a.s3.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(a.bucket),
+		Key:    aws.String(key),
+	})
+	if err == nil || isS3NotFound(err) {
+		log.Println("s3 HeadObject OK")
+		return nil
+	}
+	if isS3AccessDenied(err) {
+		return fmt.Errorf("s3 head access denied (HeadObject): %w", err)
+	}
+	return fmt.Errorf("s3 head check failed (HeadObject): %w", err)
+}
+
+func isS3NotFound(err error) bool {
+	var nsk *types.NoSuchKey
+	if errors.As(err, &nsk) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "NoSuchKey") || strings.Contains(msg, "NotFound")
+}
+
+func isS3AccessDenied(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "accessdenied") || strings.Contains(msg, "forbidden") || strings.Contains(msg, "statuscode: 403")
 }

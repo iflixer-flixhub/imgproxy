@@ -32,7 +32,8 @@ services:
       S3_ENDPOINT: "${S3_ENDPOINT}"
       S3_BUCKET: "${S3_BUCKET}"
       S3_PREFIX: "cdnhub/sss"
-      S3_REGION: "auto"
+      S3_REGION: "eu-central-2"
+      S3_INIT_CHECK: true
       DEBUG_TIME_LOGGING: "1"
 
     depends_on:

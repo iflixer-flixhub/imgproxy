@@ -66,6 +66,21 @@ func envInt64(k string, def int64) int64 {
 	return n
 }
 
+func envBool(k string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(k)))
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
+}
+
 func logLap(start time.Time, last *time.Time, msg string) {
 	if env("DEBUG_TIME_LOGGING", "0") != "1" {
 		return
